@@ -64,11 +64,15 @@ def _expected_hash() -> str | None:
         return None
 
 
+UPLOAD_DIR = _PROJECT_ROOT / "data" / "uploads"
+
+
 def _init_state() -> None:
     st.session_state.setdefault("authenticated", False)
     st.session_state.setdefault("company_name", "")
     st.session_state.setdefault("sections", {})          # section -> generated text
     st.session_state.setdefault("verification_rows", []) # list of citation/verdict dicts
+    st.session_state.setdefault("ingestion", None)       # IngestionResult-like summary
 
 
 def render_login() -> None:
@@ -109,14 +113,16 @@ def render_sidebar() -> None:
         st.session_state.company_name = st.text_input(
             "Target company", value=st.session_state.company_name, placeholder="e.g. Infosys"
         )
-        # File upload is wired into the ingestion pipeline in Stage 2.
-        st.file_uploader(
+        uploaded = st.file_uploader(
             "Supporting documents (PDF)",
             type=["pdf"],
             accept_multiple_files=True,
-            disabled=True,
-            help="Enabled in Stage 2 (ingestion engine).",
+            help="Optional. Parsed with Docling during ingestion.",
         )
+
+        run_disabled = not st.session_state.company_name.strip()
+        if st.button("Run ingestion", use_container_width=True, disabled=run_disabled):
+            _run_ingestion(uploaded)
 
         st.divider()
         if st.button("Test Groq connection", use_container_width=True):
@@ -148,6 +154,54 @@ def _run_connection_test() -> None:
         )
     else:
         st.sidebar.error(f"Groq FAILED: {result['error']}")
+
+
+def _run_ingestion(uploaded_files) -> None:
+    """Persist uploaded PDFs, run Stage 2 ingestion, and populate the panels."""
+    from src.ingestion import ingest
+
+    company = st.session_state.company_name.strip()
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    pdf_paths: list[str] = []
+    for uf in uploaded_files or []:
+        dest = UPLOAD_DIR / uf.name
+        dest.write_bytes(uf.getbuffer())
+        pdf_paths.append(str(dest))
+
+    with st.spinner(f"Ingesting sources for {company}... (Docling + web crawl)"):
+        try:
+            result = ingest(company, pdf_paths=pdf_paths)
+        except Exception as exc:
+            st.sidebar.error(f"Ingestion failed: {type(exc).__name__}: {exc}")
+            log.error(f"Ingestion failed for {company!r}: {exc}")
+            return
+
+    st.session_state.ingestion = {
+        "company": result.company,
+        "pdf_count": len(result.pdf_docs),
+        "web_count": len(result.web_docs),
+    }
+    # Surface the source inventory in the right-hand panel.
+    st.session_state.verification_rows = [
+        {
+            "source_id": d.source_id,
+            "type": d.source_type.value,
+            "title": (d.title[:60] + "...") if len(d.title) > 60 else d.title,
+            "origin": d.origin,
+            "chars": d.char_count,
+        }
+        for d in result.docs
+    ]
+    # Preview the first parsed document in the Background tab.
+    if result.docs:
+        preview = result.docs[0].text[:4000]
+        st.session_state.sections["Background"] = (
+            f"**Ingestion preview - {result.docs[0].source_id}** "
+            f"({result.docs[0].source_type.value})\n\n{preview}"
+        )
+    st.sidebar.success(
+        f"Ingested {len(result.pdf_docs)} PDF + {len(result.web_docs)} web sources."
+    )
 
 
 def render_workspace() -> None:
