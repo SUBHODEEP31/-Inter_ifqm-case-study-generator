@@ -1,0 +1,19 @@
+# Streamlit theme + server config for the IFQM Case Study Generator.
+# Corporate visual identity per the brief.
+
+[theme]
+base = "light"
+backgroundColor = "#F8F9FA"          # main canvas
+secondaryBackgroundColor = "#1E293B" # sidebar / secondary surfaces
+textColor = "#0F172A"                # headings / body text
+primaryColor = "#2563EB"             # interactive accents
+font = "sans serif"
+
+[server]
+headless = true
+runOnSave = true
+fileWatcherType = "auto"
+maxUploadSize = 200                  # MB; large annual-report PDFs
+
+[browser]
+gatherUsageStats = false

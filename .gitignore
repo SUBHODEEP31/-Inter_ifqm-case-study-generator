@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# Secrets / local config
+.env
+.streamlit/secrets.toml
+
+# Data, models, vector store, runtime artifacts
+data/chroma_db/
+data/uploads/
+output/
+logs/
+*.log
+
+# Model / HF caches if relocated into project
+.cache/
+models/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

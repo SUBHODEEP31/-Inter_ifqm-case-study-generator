@@ -1,0 +1,55 @@
+# IFQM Case Study Generator - v1 dependencies (Python 3.11, Groq-only inference)
+# Install inside the project venv: D:\ifqm-case-generator\.venv
+
+# --- Core app / config ---
+streamlit>=1.30.0
+python-dotenv>=1.0.0
+loguru>=0.7.0            # centralized structured logging (replaces stdlib logging/print)
+
+# --- LLM inference (Groq Cloud) ---
+groq>=0.11.0             # Groq SDK (was missing from the original brief)
+instructor>=1.3.0        # Pydantic-structured LLM outputs
+tenacity>=8.2.0          # exponential-backoff retries
+tiktoken>=0.6.0          # token counting
+pydantic>=2.6.0
+
+# --- Orchestration ---
+langgraph>=0.2.0
+langchain>=0.1.0
+langchain-text-splitters>=0.0.1
+
+# --- Ingestion / web research ---
+docling>=1.0.0           # multimodal layout-aware PDF parsing
+crawl4ai>=0.3.0          # async Playwright crawler (run: crawl4ai-setup after install)
+ddgs>=6.0.0              # DuckDuckGo search (renamed from duckduckgo-search)
+trafilatura>=1.8.0       # article-body extraction (replaces unmaintained newspaper3k)
+wikipedia-api>=0.6.0
+yfinance>=0.2.40
+feedparser>=6.0.0
+beautifulsoup4>=4.12.0
+unstructured>=0.12.0
+tldextract>=5.1.0
+
+# --- Cleaning / dedup ---
+ftfy>=6.1.0
+langdetect>=1.0.9
+datasketch>=1.6.0
+
+# --- Indexing / retrieval ---
+chromadb>=0.4.24
+rank_bm25>=0.2.2
+sentence-transformers>=2.5.0   # bge-large-en-v1.5 embeddings + bge-reranker-v2-m3
+
+# --- Verification (NLI) ---
+transformers>=4.38.0
+torch>=2.2.0                    # CPU build resolves automatically on Windows
+
+# --- Export ---
+python-docx>=1.1.0
+WeasyPrint>=61.0                # Windows: requires GTK3 runtime (see setup_check.py)
+Jinja2>=3.1.0
+matplotlib>=3.8.0
+tabulate>=0.9.0
+
+# --- Deferred to v2 (intentionally NOT installed in v1) ---
+# deepeval, plotly, colpali-engine, ragas, langfuse, ollama, networkx, camelot-py, pytesseract
