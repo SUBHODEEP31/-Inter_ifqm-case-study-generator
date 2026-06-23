@@ -6,8 +6,9 @@ streamlit>=1.30.0
 python-dotenv>=1.0.0
 loguru>=0.7.0            # centralized structured logging (replaces stdlib logging/print)
 
-# --- LLM inference (Groq Cloud) ---
+# --- LLM inference (Groq + Gemini dual-engine) ---
 groq>=0.11.0             # Groq SDK (was missing from the original brief)
+google-generativeai>=0.8.0  # Gemini 1.5 Flash for bulk/enrichment routing
 instructor>=1.3.0        # Pydantic-structured LLM outputs
 tenacity>=8.2.0          # exponential-backoff retries
 tiktoken>=0.6.0          # token counting

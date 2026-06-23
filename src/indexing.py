@@ -115,7 +115,7 @@ def _enrich_chunks(chunks: list[Chunk]) -> None:
     Silently degrades to a no-op if the Groq client cannot be constructed.
     """
     try:
-        from src.llm_client import ModelRole, get_llm_client
+        from src.llm_client import Role, get_llm_client
 
         client = get_llm_client()
     except Exception as exc:  # e.g. missing key
@@ -133,8 +133,9 @@ def _enrich_chunks(chunks: list[Chunk]) -> None:
             "Context sentence:"
         )
         try:
+            # BULK -> Gemini Flash (large-context, high-volume enrichment).
             header = client.complete(
-                prompt, role=ModelRole.UTILITY, system=system, max_tokens=80, temperature=0.0
+                prompt, role=Role.BULK, system=system, max_tokens=80, temperature=0.0
             )
             if header:
                 ch.text = f"{header.strip()}\n\n{ch.raw_text}"
