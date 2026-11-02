@@ -50,11 +50,11 @@ def check_search_and_crawl(company: str) -> bool:
 def check_pdf() -> bool:
     pdfs = sorted(UPLOAD_DIR.glob("*.pdf"))
     if not pdfs:
-        print("[BLOCKED] No PDF in data/uploads - drop one there to verify Docling parsing.")
+        print("[BLOCKED] No PDF in data/uploads - drop one there to verify PyMuPDF parsing.")
         return True  # not a failure
     doc = parse_pdf(pdfs[0])
     ok = len(doc.text) > 200
-    print(f"[{'PASS' if ok else 'FAIL'}] Docling parsed {pdfs[0].name}: {len(doc.text)} chars")
+    print(f"[{'PASS' if ok else 'FAIL'}] PyMuPDF parsed {pdfs[0].name}: {len(doc.text)} chars")
     return ok
 
 

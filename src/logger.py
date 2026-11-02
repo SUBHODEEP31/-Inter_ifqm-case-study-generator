@@ -46,14 +46,27 @@ def _configure() -> None:
     logger.remove()  # drop loguru's default stderr handler
     level = os.getenv("LOG_LEVEL", "INFO").upper()
 
+    def format_stderr(record):
+        module_name = record["extra"].get("module", record["name"].split(".")[-1] or "ifqm")
+        record["extra"]["module"] = module_name
+        return (
+            "<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | "
+            "<cyan>{extra[module]}</cyan> - <level>{message}</level>\n"
+        )
+
+    def format_file(record):
+        module_name = record["extra"].get("module", record["name"].split(".")[-1] or "ifqm")
+        record["extra"]["module"] = module_name
+        return (
+            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+            "{extra[module]} | {message}\n"
+        )
+
     logger.add(
         sys.stderr,
         level=level,
         colorize=True,
-        format=(
-            "<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | "
-            "<cyan>{extra[module]}</cyan> - <level>{message}</level>"
-        ),
+        format=format_stderr,
     )
     logger.add(
         _LOG_FILE,
@@ -64,10 +77,7 @@ def _configure() -> None:
         enqueue=True,  # process-safe; tolerant of Streamlit's threads
         backtrace=True,
         diagnose=False,
-        format=(
-            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
-            "{extra[module]} | {message}"
-        ),
+        format=format_file,
     )
     _CONFIGURED = True
 

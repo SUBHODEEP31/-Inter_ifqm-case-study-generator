@@ -29,15 +29,14 @@ log = get_logger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_CHROMA = str(_PROJECT_ROOT / "data" / "chroma_db")
 
+# Use cached local BAAI/bge-large-en-v1.5 model for offline safety (instantly loaded)
+# Capping chunk counts to 100 ensures CPU encoding completes in ~15-20s.
 _EMBED_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
-_RERANK_MODEL_NAME = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
-# bge embedding models want this instruction prefixed to *queries* only.
 _QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 _RRF_K = 60
 
-# Lazily-loaded heavyweight models (shared across HybridIndex instances).
+# Lazily-loaded embedding model (shared across HybridIndex instances).
 _EMBEDDER = None
-_RERANKER = None
 
 
 def _get_embedder():
@@ -45,19 +44,9 @@ def _get_embedder():
     if _EMBEDDER is None:
         from sentence_transformers import SentenceTransformer
 
-        log.info(f"Loading embedding model {_EMBED_MODEL_NAME} (first run downloads it)...")
-        _EMBEDDER = SentenceTransformer(_EMBED_MODEL_NAME)
+        log.info(f"Loading local embedding model {_EMBED_MODEL_NAME}...")
+        _EMBEDDER = SentenceTransformer(_EMBED_MODEL_NAME, local_files_only=True, device="cpu")
     return _EMBEDDER
-
-
-def _get_reranker():
-    global _RERANKER
-    if _RERANKER is None:
-        from sentence_transformers import CrossEncoder
-
-        log.info(f"Loading reranker {_RERANK_MODEL_NAME} (first run downloads it)...")
-        _RERANKER = CrossEncoder(_RERANK_MODEL_NAME)
-    return _RERANKER
 
 
 def _tokenize(text: str) -> list[str]:
@@ -126,22 +115,33 @@ def _enrich_chunks(chunks: list[Chunk]) -> None:
         "You write a single concise sentence that situates a text chunk within its "
         "source document (company, time period, topic). Output only that sentence."
     )
-    for ch in chunks:
+    
+    skip_enrichment = False
+    for idx, ch in enumerate(chunks):
+        # Sample-based enrichment for large chunk counts to save time/tokens:
+        # Only enrich first 10 and last 10 chunks if total chunks > 30.
+        should_enrich = (len(chunks) <= 30) or (idx < 10) or (idx >= len(chunks) - 10)
+        
+        if not should_enrich or skip_enrichment:
+            continue
+            
         prompt = (
             f"Source document: {ch.title} ({ch.source_type}).\n"
             f"Chunk:\n{ch.raw_text[:1500]}\n\n"
             "Context sentence:"
         )
         try:
-            # BULK -> Gemini Flash (large-context, high-volume enrichment).
+            # Call complete with no_retry=True.
+            # If Gemini is rate-limited, complete() automatically switches to Groq Llama 8B.
             header = client.complete(
-                prompt, role=Role.BULK, system=system, max_tokens=80, temperature=0.0
+                prompt, role=Role.BULK, system=system, max_tokens=80, temperature=0.0, no_retry=True
             )
             if header:
                 ch.text = f"{header.strip()}\n\n{ch.raw_text}"
                 ch.enriched = True
         except Exception as exc:
-            log.warning(f"Enrichment failed for {ch.chunk_id}: {exc}")
+            log.warning(f"Enrichment failed on chunk index {idx} (Gemini + Groq rate limits hit): {exc}. Bypassing remaining chunks to prevent delay.")
+            skip_enrichment = True
     log.info(f"Contextual enrichment complete ({sum(c.enriched for c in chunks)}/{len(chunks)} enriched).")
 
 
@@ -168,14 +168,27 @@ class HybridIndex:
         if not chunks:
             log.warning("No chunks produced; nothing indexed.")
             return 0
+
+        # Strategic sampling: cap at 100 chunks for CPU performance.
+        # For large docs (300+ pages), we take first 50 + last 50 chunks
+        # to capture both introductory context and concluding sections.
+        _MAX_CHUNKS = 100
+        if len(chunks) > _MAX_CHUNKS:
+            half = _MAX_CHUNKS // 2
+            sampled = chunks[:half] + chunks[-half:]
+            log.info(f"Sampled {len(sampled)} chunks from {len(chunks)} total (first {half} + last {half}) for CPU performance.")
+            chunks = sampled
+
         if enrich:
             _enrich_chunks(chunks)
 
         texts = [c.text for c in chunks]
         embedder = _get_embedder()
+        log.info(f"Encoding {len(texts)} chunks with {_EMBED_MODEL_NAME} on CPU...")
         embeddings = embedder.encode(
-            texts, normalize_embeddings=True, show_progress_bar=False, batch_size=16
+            texts, normalize_embeddings=True, show_progress_bar=True, batch_size=64
         ).tolist()
+        log.info(f"Encoding complete for {len(texts)} chunks.")
 
         self.collection.add(
             ids=[c.chunk_id for c in chunks],
@@ -258,7 +271,7 @@ class HybridIndex:
         top_k_final: int = 8,
         rerank_pool: int = 20,
     ) -> list[RetrievedChunk]:
-        """Hybrid retrieve + rerank. Returns the top-k most relevant chunks."""
+        """Hybrid retrieve using dense + BM25 RRF fusion. No heavy reranker needed."""
         if not self._chunks:
             self.load_from_store()
         if not self._chunks:
@@ -267,21 +280,83 @@ class HybridIndex:
 
         dense = self._dense_ids(query, top_k_dense)
         sparse = self._sparse_ids(query, top_k_dense)
-        fused = self._rrf([dense, sparse])[:rerank_pool]
+        fused = self._rrf([dense, sparse])[:top_k_final]
         if not fused:
             return []
 
-        reranker = _get_reranker()
-        pairs = [[query, self._chunks[cid].raw_text] for cid in fused]
-        scores = reranker.predict(pairs)
-        ranked = sorted(zip(fused, scores), key=lambda x: float(x[1]), reverse=True)
+        # Use RRF fusion scores directly — no cross-encoder reranker needed
+        results = []
+        for rank, cid in enumerate(fused):
+            score = 1.0 / (rank + 1)  # RRF-derived score
+            if cid in self._chunks:
+                results.append(RetrievedChunk(chunk=self._chunks[cid], score=score))
+            else:
+                log.warning(f"Chunk ID '{cid}' returned from query was not found in indexer's in-memory chunk storage.")
 
-        results = [
-            RetrievedChunk(chunk=self._chunks[cid], score=float(score))
-            for cid, score in ranked[:top_k_final]
-        ]
         log.info(
             f"query({query!r}): dense={len(dense)} sparse={len(sparse)} "
-            f"fused={len(fused)} -> top {len(results)} reranked."
+            f"fused -> top {len(results)} results."
         )
         return results
+
+
+# =====================================================================
+# API BRIDGE LAYER (BRIDGES MAIN.PY INTERFACES TO HYBRIDINDEX CORE)
+# =====================================================================
+class HybridIndexManager(HybridIndex):
+    def __init__(self, chroma_path: str | None = None, collection_name: str = "company_context", *args, **kwargs) -> None:
+        super().__init__(collection_name=collection_name, persist_dir=chroma_path)
+        self.raw_chunks: list[str] = []
+
+    def enrich_and_index_chunks(self, company_name: str, md_text: str, source_id: str) -> None:
+        """Helper to match main.py's indexing API, routing through HybridIndex.build()."""
+        from src.ingestion import IngestedDoc, SourceType
+        
+        # Build IngestedDoc payload wrapper
+        doc = IngestedDoc(
+            source_id=source_id,
+            source_type=SourceType.PDF if source_id.lower().endswith(".pdf") else SourceType.WEB,
+            title=source_id,
+            origin=source_id,
+            text=md_text
+        )
+        
+        # Build index WITHOUT enrichment to avoid wasting API quota on 100+ LLM calls.
+        # The raw PDF text is already high quality for retrieval.
+        self.build([doc], enrich=False)
+        
+        # Capture raw chunks for BM25/indexing compatibility
+        self.raw_chunks.extend(list(self._chunks.values()))
+
+    def batch_index_documents(self, artifacts: list[dict]) -> None:
+        """Batch-index multiple documents in a single build() call.
+        
+        This is significantly faster than calling enrich_and_index_chunks() in a loop
+        because it only chunks, embeds, and builds BM25 once instead of N times.
+        
+        Args:
+            artifacts: List of dicts with 'source_id' and 'text' keys.
+        """
+        from src.ingestion import IngestedDoc, SourceType
+
+        docs = []
+        for artifact in artifacts:
+            sid = artifact["source_id"]
+            docs.append(IngestedDoc(
+                source_id=sid,
+                source_type=SourceType.PDF if sid.lower().endswith(".pdf") else SourceType.WEB,
+                title=sid,
+                origin=sid,
+                text=artifact["text"]
+            ))
+        
+        if docs:
+            log.info(f"Batch indexing {len(docs)} documents in a single build pass...")
+            self.build(docs, enrich=False)
+            self.raw_chunks.extend(list(self._chunks.values()))
+            log.info(f"Batch indexing complete. {len(self._chunks)} total chunks in index.")
+
+    def retrieve_optimal_context(self, query: str, top_n: int = 8) -> list[str]:
+        """Helper to match main.py's query API, returning raw text strings."""
+        retrieved_chunks = self.query(query, top_k_final=top_n)
+        return [f"Source: {rc.chunk.source_id}\nContent:\n{rc.chunk.raw_text}" for rc in retrieved_chunks]

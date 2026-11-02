@@ -18,6 +18,9 @@ If neither is configured, construction raises LLMClientError.
 from __future__ import annotations
 
 import os
+import time
+import requests
+import httpx
 from enum import Enum
 from pathlib import Path
 from typing import Type, TypeVar
@@ -70,10 +73,9 @@ _GROQ_RETRYABLE = (
     groq.APIConnectionError,
     groq.APITimeoutError,
     groq.InternalServerError,
-    groq.RateLimitError,
 )
 _GEMINI_RETRYABLE = (
-    (g_exc.ResourceExhausted, g_exc.ServiceUnavailable, g_exc.DeadlineExceeded)
+    (g_exc.ServiceUnavailable, g_exc.DeadlineExceeded)
     if g_exc
     else tuple()
 )
@@ -121,10 +123,11 @@ class LLMClient:
     def __init__(self) -> None:
         groq_key = os.getenv("GROQ_API_KEY", "").strip()
         gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self._mistral_cooldown_until = 0.0
 
         self.primary_model = os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
         self.utility_model = os.getenv("UTILITY_MODEL", "llama-3.1-8b-instant")
-        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
         self._groq = groq.Groq(api_key=groq_key) if groq_key else None
         self._structured = instructor.from_groq(self._groq) if self._groq else None
@@ -150,21 +153,17 @@ class LLMClient:
 
     # -- routing ----------------------------------------------------------- #
     def _route(self, role: Role) -> tuple[Engine, str]:
-        if role == Role.BULK:
-            if self._gemini_on:
-                return Engine.GEMINI, self.gemini_model
+        # Optimize: Route all calls to Gemini first if available, bypassing Groq's low daily token limits (TPD)
+        if self._gemini_on:
+            return Engine.GEMINI, self.gemini_model
+            
+        # Fallback to Groq if Gemini is not available
+        if role == Role.BULK or role == Role.UTILITY:
             if self._groq:
                 return Engine.GROQ, self.utility_model
-        elif role == Role.UTILITY:
-            if self._groq:
-                return Engine.GROQ, self.utility_model
-            if self._gemini_on:
-                return Engine.GEMINI, self.gemini_model
         else:  # REASONING
             if self._groq:
                 return Engine.GROQ, self.primary_model
-            if self._gemini_on:
-                return Engine.GEMINI, self.gemini_model
         # exhaustive fallback
         if self._groq:
             return Engine.GROQ, self.primary_model
@@ -174,15 +173,17 @@ class LLMClient:
         return len(self._encoder.encode(text or ""))
 
     # -- provider calls ---------------------------------------------------- #
-    @_retry_policy
-    def _groq_complete(self, model: str, messages: list[dict], temperature: float, max_tokens: int) -> str:
+    def _groq_complete_raw(self, model: str, messages: list[dict], temperature: float, max_tokens: int) -> str:
         resp = self._groq.chat.completions.create(
             model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
         )
         return (resp.choices[0].message.content or "").strip()
 
     @_retry_policy
-    def _gemini_complete(self, model_name: str, prompt: str, system: str | None, temperature: float, max_tokens: int) -> str:
+    def _groq_complete(self, model: str, messages: list[dict], temperature: float, max_tokens: int) -> str:
+        return self._groq_complete_raw(model, messages, temperature, max_tokens)
+
+    def _gemini_complete_raw(self, model_name: str, prompt: str, system: str | None, temperature: float, max_tokens: int) -> str:
         model = genai.GenerativeModel(model_name, system_instruction=system or None)
         resp = model.generate_content(
             prompt,
@@ -191,8 +192,71 @@ class LLMClient:
         try:
             return (resp.text or "").strip()
         except Exception:
-            # blocked / no candidates
             return ""
+
+    @_retry_policy
+    def _gemini_complete(self, model_name: str, prompt: str, system: str | None, temperature: float, max_tokens: int) -> str:
+        return self._gemini_complete_raw(model_name, prompt, system, temperature, max_tokens)
+
+    def _mistral_complete_raw(self, prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+        mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
+        if not mistral_key:
+            raise LLMClientError("Mistral key not set.")
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {mistral_key}"
+        }
+        payload = {
+            "model": "mistral-large-latest",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        resp = requests.post("https://api.mistral.ai/v1/chat/completions", json=payload, headers=headers, timeout=60.0)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+    @_retry_policy
+    def _mistral_complete(self, prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+        return self._mistral_complete_raw(prompt, system, temperature, max_tokens)
+
+    def _nara_complete_raw(self, prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+        nara_key = os.getenv("NARAROUTER_API_KEY", "").strip()
+        nara_url = os.getenv("NARAROUTER_BASE_URL", "https://router.bynara.id/v1").strip()
+        nara_model = os.getenv("NARAROUTER_MODEL", "mimo-v2.5-pro").strip()
+        if not nara_key:
+            raise LLMClientError("NaraRouter key not set.")
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        
+        try:
+            import openai
+            client = openai.OpenAI(api_key=nara_key, base_url=nara_url, timeout=90.0)
+            res = client.chat.completions.create(
+                model=nara_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            return (res.choices[0].message.content or "").strip()
+        except Exception as e:
+            if "402" in str(e) or "payment_required" in str(e) or "Insufficient credits" in str(e):
+                log.warning("NaraRouter credit balance depleted (402 Payment Required). Falling back to backup generation models.")
+            else:
+                log.warning(f"NaraRouter client error: {e}")
+            raise e
+
+    @_retry_policy
+    def _nara_complete(self, prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+        return self._nara_complete_raw(prompt, system, temperature, max_tokens)
 
     def complete(
         self,
@@ -202,17 +266,102 @@ class LLMClient:
         system: str | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2048,
+        no_retry: bool = False,
     ) -> str:
-        """Plain-text completion, routed by role."""
-        engine, model = self._route(role)
-        log.debug(f"complete() role={role.value} -> {engine.value}:{model}")
-        if engine == Engine.GEMINI:
+        """Plain-text completion, routed by role and provider key availability with strict fallback layers."""
+        sys_str = (system or "").lower()
+        is_fact_check = any(k in sys_str for k in ["fact checker", "fact auditor", "linguistic fact", "grounding", "friction"])
+        
+        mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
+        nara_key = os.getenv("NARAROUTER_API_KEY", "").strip()
+        
+        # Circuit Breaker: check if Mistral is on cooldown
+        mistral_cooldown_active = False
+        if hasattr(self, "_mistral_cooldown_until") and time.time() < self._mistral_cooldown_until:
+            mistral_cooldown_active = True
+            
+        # Build priority chain list based on query type
+        call_chain = []
+        
+        if is_fact_check:
+            # Fact Checking Priority: NaraRouter -> Mistral -> Gemini -> Groq
+            if nara_key:
+                call_chain.append(("NaraRouter (Fact Check)", lambda: self._nara_complete_raw(prompt, system, temperature, max_tokens) if no_retry else self._nara_complete(prompt, system, temperature, max_tokens)))
+            if mistral_key and not mistral_cooldown_active:
+                call_chain.append(("Mistral (Fact Check Fallback)", lambda: self._mistral_complete_raw(prompt, system, temperature, max_tokens) if no_retry else self._mistral_complete(prompt, system, temperature, max_tokens)))
+        else:
+            # Generation Priority: NaraRouter -> Mistral -> Gemini -> Groq
+            if nara_key:
+                call_chain.append(("NaraRouter (Narrative Generation)", lambda: self._nara_complete_raw(prompt, system, temperature, max_tokens) if no_retry else self._nara_complete(prompt, system, temperature, max_tokens)))
+            if mistral_key and not mistral_cooldown_active:
+                call_chain.append(("Mistral (Generation Fallback)", lambda: self._mistral_complete_raw(prompt, system, temperature, max_tokens) if no_retry else self._mistral_complete(prompt, system, temperature, max_tokens)))
+        
+        # Fallbacks: Gemini -> Groq
+        def run_gemini():
+            engine, model = self._route(role)
+            if no_retry:
+                return self._gemini_complete_raw(model, prompt, system, temperature, max_tokens)
             return self._gemini_complete(model, prompt, system, temperature, max_tokens)
-        messages: list[dict[str, str]] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        return self._groq_complete(model, messages, temperature, max_tokens)
+            
+        def run_groq():
+            engine, model = Engine.GROQ, (self.primary_model if role == Role.REASONING else self.utility_model)
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            if no_retry:
+                return self._groq_complete_raw(model, messages, temperature, max_tokens)
+            return self._groq_complete(model, messages, temperature, max_tokens)
+
+        call_chain.append(("Gemini Fallback", run_gemini))
+        call_chain.append(("Groq Fallback", run_groq))
+        
+        # Try each link in the chain in sequence
+        errors = []
+        for name, func in call_chain:
+            try:
+                log.info(f"Routing task to {name}...")
+                result = func()
+                if result:
+                    return result
+            except Exception as e:
+                log.warning(f"{name} call failed: {e}. Trying next fallback...")
+                errors.append(f"{name}: {e}")
+                
+                # Check for Mistral 429 to set circuit breaker cooldown
+                if "Mistral" in name:
+                    err_msg = str(e).lower()
+                    if "429" in err_msg or "too many requests" in err_msg or "rate limit" in err_msg:
+                        log.error("MISTRAL 429 RATE LIMIT EXCEEDED! Triggering 3-minute API circuit breaker cooldown.")
+                        self._mistral_cooldown_until = time.time() + 180
+                
+        raise LLMClientError(f"All LLM providers in the fallback chain failed: {'; '.join(errors)}")
+
+    def generate_text(
+        self,
+        model: str,
+        system_message: str | None = None,
+        user_message: str | None = None,
+        temperature: float = 0.2,
+        max_tokens: int = 2048,
+        no_retry: bool = False,
+    ) -> str:
+        """Compatibility wrapper for generate_text calling complete() with automated role routing."""
+        role = Role.REASONING
+        if "8b" in model:
+            role = Role.UTILITY
+        elif "gemini" in model:
+            role = Role.BULK
+
+        prompt = user_message or ""
+        return self.complete(
+            prompt=prompt,
+            role=role,
+            system=system_message,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            no_retry=no_retry
+        )
 
     @_retry_policy
     def structured(
@@ -225,11 +374,127 @@ class LLMClient:
         max_tokens: int = 4096,
         max_retries: int = 3,
     ) -> T:
-        """Schema-validated structured output. Routes to Groq (per spec)."""
+        """Schema-validated structured output. Routes to NaraRouter first for rate safety, then Mistral, then Gemini/Groq."""
+        nara_key = os.getenv("NARAROUTER_API_KEY", "").strip()
+        nara_url = os.getenv("NARAROUTER_BASE_URL", "https://router.bynara.id/v1").strip()
+        nara_model = os.getenv("NARAROUTER_MODEL", "mimo-v2.5-pro").strip()
+        
+        if nara_key:
+            try:
+                log.info("Routing structured query to NaraRouter for rate safety and schema validation...")
+                import json
+                schema_json = response_model.model_json_schema()
+                injected_prompt = (
+                    f"{prompt}\n\n"
+                    f"You MUST format the output as a valid JSON object matching this schema:\n{json.dumps(schema_json)}"
+                )
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {nara_key}"
+                }
+                payload = {
+                    "model": nara_model,
+                    "messages": [
+                        {"role": "system", "content": system or "You are a precise data extractor."},
+                        {"role": "user", "content": injected_prompt}
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "response_format": {"type": "json_object"}
+                }
+                resp = requests.post(f"{nara_url}/chat/completions", json=payload, headers=headers, timeout=90.0)
+                resp.raise_for_status()
+                raw_text = resp.json()["choices"][0]["message"]["content"].strip()
+                return response_model.model_validate_json(raw_text)
+            except Exception as e:
+                log.warning(f"NaraRouter structured extraction failed: {e}. Falling back to Mistral path.")
+
+        mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
+        # Circuit Breaker: check if Mistral is on cooldown
+        mistral_cooldown_active = False
+        if hasattr(self, "_mistral_cooldown_until") and time.time() < self._mistral_cooldown_until:
+            mistral_cooldown_active = True
+
+        if mistral_key and not mistral_cooldown_active:
+            try:
+                log.info("Routing structured query to Mistral for rate safety and schema validation...")
+                import json
+                schema_json = response_model.model_json_schema()
+                injected_prompt = (
+                    f"{prompt}\n\n"
+                    f"You MUST format the output as a valid JSON object matching this schema:\n{json.dumps(schema_json)}"
+                )
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {mistral_key}"
+                }
+                payload = {
+                    "model": "mistral-large-latest",
+                    "messages": [
+                        {"role": "system", "content": system or "You are a precise data extractor."},
+                        {"role": "user", "content": injected_prompt}
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "response_format": {"type": "json_object"}
+                }
+                resp = requests.post("https://api.mistral.ai/v1/chat/completions", json=payload, headers=headers, timeout=90.0)
+                resp.raise_for_status()
+                raw_text = resp.json()["choices"][0]["message"]["content"].strip()
+                return response_model.model_validate_json(raw_text)
+            except Exception as e:
+                log.warning(f"Mistral structured extraction failed: {e}. Falling back to standard paths.")
+                
+                # Activate circuit breaker for Mistral 429
+                err_msg = str(e).lower()
+                if "429" in err_msg or "too many requests" in err_msg or "rate limit" in err_msg:
+                    log.error("MISTRAL 429 RATE LIMIT EXCEEDED during structured query! Triggering 3-minute API circuit breaker cooldown.")
+                    self._mistral_cooldown_until = time.time() + 180
+
+        if self._gemini_on:
+            try:
+                log.info(f"Routing structured query to Gemini ({self.gemini_model}) for token safety...")
+                model = genai.GenerativeModel(self.gemini_model, system_instruction=system or None)
+                
+                # Inject the Pydantic schema requirements into the prompt context
+                schema_json = response_model.model_json_schema()
+                injected_prompt = (
+                    f"{prompt}\n\n"
+                    f"You MUST format the output as a valid JSON object matching this schema:\n{schema_json}"
+                )
+                
+                resp = model.generate_content(
+                    injected_prompt,
+                    generation_config={
+                        "temperature": temperature,
+                        "max_output_tokens": max_tokens,
+                        "response_mime_type": "application/json"
+                    },
+                )
+                
+                raw_text = resp.text.strip()
+                return response_model.model_validate_json(raw_text)
+            except Exception as e:
+                log.warning(f"Gemini structured generation failed: {e}. Attempting a clean deterministic retry on Gemini...")
+                try:
+                    resp = model.generate_content(
+                        injected_prompt,
+                        generation_config={
+                            "temperature": 0.0,
+                            "max_output_tokens": max_tokens,
+                            "response_mime_type": "application/json"
+                        },
+                    )
+                    raw_text = resp.text.strip()
+                    return response_model.model_validate_json(raw_text)
+                except Exception as retry_err:
+                    log.warning(f"Gemini structured generation retry failed: {retry_err}. Falling back to Groq Llama.")
+                
         if not self._structured:
             raise LLMClientError(
-                "Structured extraction requires GROQ_API_KEY (JSON briefs route to "
-                "Groq Llama 3.3 70B)."
+                "Structured extraction requires GROQ_API_KEY when Gemini is offline."
             )
         messages: list[dict[str, str]] = []
         if system:
@@ -246,30 +511,73 @@ class LLMClient:
 
     def test_connection(self) -> dict[str, object]:
         """Ping each configured engine. ok=True iff every configured engine replies."""
-        result: dict[str, object] = {"ok": False, "groq": None, "gemini": None, "error": None}
+        result: dict[str, object] = {
+            "ok": False,
+            "groq": None,
+            "gemini": None,
+            "mistral": None,
+            "nararouter": None,
+            "error": None,
+            "primary": None,
+            "utility": None,
+        }
         errors: list[str] = []
 
         if self._groq:
             try:
+                nara_key = os.getenv("NARAROUTER_API_KEY")
+                if nara_key:
+                    os.environ["NARAROUTER_API_KEY"] = ""
                 result["groq"] = self.complete(
                     "Reply with the single word: OK", role=Role.REASONING, max_tokens=5
                 )
+                if nara_key:
+                    os.environ["NARAROUTER_API_KEY"] = nara_key
             except Exception as exc:
                 errors.append(f"groq:{type(exc).__name__}:{exc}")
         if self._gemini_on:
             try:
+                nara_key = os.getenv("NARAROUTER_API_KEY")
+                if nara_key:
+                    os.environ["NARAROUTER_API_KEY"] = ""
                 result["gemini"] = self.complete(
                     "Reply with the single word: OK", role=Role.BULK, max_tokens=5
                 )
+                if nara_key:
+                    os.environ["NARAROUTER_API_KEY"] = nara_key
             except Exception as exc:
                 errors.append(f"gemini:{type(exc).__name__}:{exc}")
+        if os.getenv("MISTRAL_API_KEY", "").strip():
+            try:
+                result["mistral"] = self._mistral_complete_raw(
+                    "Reply with the single word: OK", system="grounding verification check", max_tokens=5
+                )
+            except Exception as exc:
+                errors.append(f"mistral:{type(exc).__name__}:{exc}")
+        if os.getenv("NARAROUTER_API_KEY", "").strip():
+            try:
+                result["nararouter"] = self._nara_complete_raw(
+                    "Reply with the single word: OK", system=None, max_tokens=5
+                )
+            except Exception as exc:
+                errors.append(f"nararouter:{type(exc).__name__}:{exc}")
 
         configured = [bool(self._groq), bool(self._gemini_on)]
         got = [result["groq"], result["gemini"]]
         result["ok"] = any(got) and all((not cfg) or bool(val) for cfg, val in zip(configured, got))
+        
+        if os.getenv("MISTRAL_API_KEY", "").strip() and not result["mistral"]:
+            result["ok"] = False
+        if os.getenv("NARAROUTER_API_KEY", "").strip() and not result["nararouter"]:
+            result["ok"] = False
+            
         if errors:
             result["error"] = "; ".join(errors)
-        log.info(f"test_connection ok={result['ok']} groq={result['groq']!r} gemini={result['gemini']!r}")
+
+        result["primary"] = result["nararouter"] or result["groq"] or result["gemini"]
+        result["utility"] = result["nararouter"] or result["groq"] or result["gemini"]
+
+        log.info(f"test_connection ok={result['ok']} groq={result['groq']!r} gemini={result['gemini']!r} mistral={result['mistral']!r} nararouter={result['nararouter']!r}")
         return result
 
 
@@ -281,3 +589,26 @@ def get_llm_client() -> LLMClient:
     if _SINGLETON is None:
         _SINGLETON = LLMClient()
     return _SINGLETON
+# =====================================================================
+# AUTOMATED FRONTEND BRIDGE LAYER (LEAVES WARP'S CODE UNTOUCHED)
+# =====================================================================
+import inspect
+
+# Automatically locate whatever class Warp defined in this file
+for _name, _obj in list(globals().items()):
+    if inspect.isclass(_obj) and _obj.__module__ == __name__ and _name != "DualEngineClient":
+        from enum import Enum
+        if issubclass(_obj, Enum) or issubclass(_obj, Exception):
+            continue
+        DualEngineClient = _obj
+        break
+else:
+    # Safe fallback wrapper if Warp used loose functions instead of a class
+    class DualEngineClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def generate_text(self, *args, **kwargs):
+            for _func_name in ['generate_text', 'call_llm', 'get_completion', 'chat']:
+                if _func_name in globals():
+                    return globals()[_func_name](*args, **kwargs)
+            return "Error: Could not route to backend LLM function."

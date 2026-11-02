@@ -1,31 +1,72 @@
-# Python
+# =====================================================================
+# Python & Bytecode
+# =====================================================================
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
-# Virtual environment
+# =====================================================================
+# Virtual Environments
+# =====================================================================
 .venv/
 venv/
+env/
+ENV/
 
-# Secrets / local config
+# =====================================================================
+# Secrets & Environment Variables (STRICT - NEVER COMMIT)
+# =====================================================================
 .env
+.env.*
+!.env.example
+*.env
 .streamlit/secrets.toml
 
-# Data, models, vector store, runtime artifacts
+# =====================================================================
+# Frontend & Node Artifacts
+# =====================================================================
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+frontend/out/
+frontend/build/
+.npm
+*.tsbuildinfo
+frontend/.env*.local
+
+# =====================================================================
+# Unrelated Nested Projects
+# =====================================================================
+kalaa-krityy/
+
+# =====================================================================
+# Vector Stores, Runtime Artifacts, Sessions & Logs
+# =====================================================================
 data/chroma_db/
+data/chroma_test/
 data/uploads/
+data/runtime_inputs/
+data/sessions/
+data/exports/
 output/
 logs/
 *.log
 
-# Model / HF caches if relocated into project
+# =====================================================================
+# Hugging Face & Model Weight Caches
+# =====================================================================
 .cache/
 models/
+model/final_model/
 
-# OS / editor
+# =====================================================================
+# OS & IDE Settings
+# =====================================================================
 .DS_Store
 Thumbs.db
 .idea/
